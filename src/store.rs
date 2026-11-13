@@ -6,23 +6,38 @@ use std::io::Write;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::mpsc::Sender;
+
+
+struct WriteRequest {
+    bytes: Vec<u8>,
+    reply_tx: Sender<std::io::Result<u64>>,
+}
 
 pub struct LogStore {
-    file: File,
-    current_offset: u64,
-    index: Vec<u64>,
+    path: PathBuf,
+
+    write_tx: Sender<WriteRequest>,
+
+    index: Arc<RwLock<Vec<u64>>>,
 }
 
 impl LogStore {
     pub fn open<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+
+        let path_buf = path.as_ref().to_path_buf();
+
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(&path_buf)?;
 
-        let mut index = Vec::new();
+        let mut initial_index = Vec::new();
 
         file.seek(SeekFrom::Start(0))?;
 
@@ -35,8 +50,7 @@ impl LogStore {
             let mut header_buf = [0u8; 8];
             match file.read_exact(&mut header_buf) {
                 Ok(()) => {
-                    index.push(current_pos);
-
+                    initial_index.push(current_pos);
                     let length = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
                     file.seek(SeekFrom::Current(length as i64))?;
                 }
@@ -48,12 +62,20 @@ impl LogStore {
         }
 
 
-        let current_offset = file.stream_position()?;
+        let mut current_offset = file.stream_position()?;
+
+        let index = Arc::new(RwLock::new(initial_index));
+        let flusher_index = Arc::clone(&index);
+
+        let (write_tx, write_tx) = mpsc::channel::<WriteRequest>();
 
         Ok(LogStore {
             file,
             current_offset,
             index,
+            is_syncing: false,
+            pending_batch: Vec::new(),
+            sync_generation: 0,
         })
     }
 
@@ -70,16 +92,38 @@ impl LogStore {
 
         let bytes = record.serialize();
 
-        let offset = self.current_offset;
+        let offset = self.current_offset + self.pending_batch.iter().map(|b| b.len() as u64).sum::<u64>();
         self.index.push(offset);
-        self.file.seek(SeekFrom::Start(self.current_offset))?;
 
-        self.file.write_all(&bytes)?;
+        self.pending_batch.push(bytes);
 
-        self.current_offset += bytes.len() as u64;
+        if self.is_syncing {
+            return Ok(offset);
+        }
 
+        self.is_syncing = true; // i am the captain now
+
+        while !self.pending_batch.is_empty() {
+            let batch = std::mem::take(&mut self.pending_batch);
+
+            self.file.seek(SeekFrom::Start(self.current_offset))?;
+
+
+            let mut batch_bytes = Vec::new();
+            for record_bytes in batch {
+                batch_bytes.extend(record_bytes);
+            }
+
+            self.file.write_all(&batch_bytes)?;
+            self.current_offset += batch_bytes.len() as u64;
+
+            self.file.sync_all()?;
+        }
+
+        self.is_syncing = false;
         Ok(offset)
     }
+
 
     pub fn read_all(&mut self) -> std::io::Result<Vec<Record>> {
         let mut records = Vec::new();
