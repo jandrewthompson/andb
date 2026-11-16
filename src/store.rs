@@ -1,6 +1,6 @@
 use crate::record::Record;
-use std::fs::OpenOptions;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
 use std::io::Seek;
@@ -9,8 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::mpsc::Sender;
-
+use std::sync::mpsc::{self, Sender};
 
 struct WriteRequest {
     bytes: Vec<u8>,
@@ -20,7 +19,7 @@ struct WriteRequest {
 pub struct LogStore {
     path: PathBuf,
 
-    write_tx: Sender<WriteRequest>,
+    request_tx: Sender<WriteRequest>,
 
     index: Arc<RwLock<Vec<u64>>>,
 }
@@ -67,20 +66,67 @@ impl LogStore {
         let index = Arc::new(RwLock::new(initial_index));
         let flusher_index = Arc::clone(&index);
 
-        let (write_tx, write_tx) = mpsc::channel::<WriteRequest>();
+        let (request_tx, request_rx) = mpsc::channel::<WriteRequest>();
+
+        std::thread::spawn(move || {
+            while let Ok(first_req) = request_rx.recv() {
+                //1. start a batch with the first request that woke us up
+                let mut batch = vec![first_req];
+
+                //2. drain any other requests that arrived concurrently
+                while let Ok(req) = request_rx.try_recv() {
+                    batch.push(req);
+                }
+
+                //3. serialize all records in the batch into one contiguous buffer
+                let mut combined_bytes = Vec::new();
+                let mut offsets = Vec::with_capacity(batch.len());
+
+                for req in &batch {
+                    let rec_offset = current_offset + combined_bytes.len() as u64;
+                    offsets.push(rec_offset);
+                    combined_bytes.extend_from_slice(&req.bytes);
+                }
+
+                //4. perform one single write and one single fsync for the batch
+                let write_result = file
+                    .seek(SeekFrom::Start(current_offset))
+                    .and_then(|_| file.write_all(&combined_bytes))
+                    .and_then(|_| file.sync_all());
+
+                match write_result {
+                    Ok(()) => {
+                        current_offset += combined_bytes.len() as u64;
+                        {
+                            let mut idx_guard = flusher_index.write().unwrap();
+                            idx_guard.extend_from_slice(&offsets);
+                        } 
+                        for (req, offset) in batch.into_iter().zip(offsets) {
+                            let _ = req.reply_tx.send(Ok(offset));
+                        }
+                    }
+                    Err(e) => {
+                        let kind = e.kind();
+                        let msg = e.to_string();
+                        for req in batch {
+                            let _ = req.reply_tx.send(Err(std::io::Error::new(kind, msg.clone())));
+                        }
+                    }
+                }
+            }
+
+        });
+
 
         Ok(LogStore {
-            file,
-            current_offset,
+            path: path_buf,
+            request_tx,
             index,
-            is_syncing: false,
-            pending_batch: Vec::new(),
-            sync_generation: 0,
         })
     }
 
 
-    pub fn append(&mut self, payload: &[u8]) -> std::io::Result<u64> {
+    pub fn append(&self, payload: &[u8]) -> std::io::Result<u64> {
         let length = payload.len() as u32;
         let checksum = 0; //temp static crc32
         
@@ -92,54 +138,32 @@ impl LogStore {
 
         let bytes = record.serialize();
 
-        let offset = self.current_offset + self.pending_batch.iter().map(|b| b.len() as u64).sum::<u64>();
-        self.index.push(offset);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let req = WriteRequest { bytes, reply_tx };
 
-        self.pending_batch.push(bytes);
+        self.request_tx.send(req).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Flusher thread stopped")
+        })?;
 
-        if self.is_syncing {
-            return Ok(offset);
-        }
-
-        self.is_syncing = true; // i am the captain now
-
-        while !self.pending_batch.is_empty() {
-            let batch = std::mem::take(&mut self.pending_batch);
-
-            self.file.seek(SeekFrom::Start(self.current_offset))?;
-
-
-            let mut batch_bytes = Vec::new();
-            for record_bytes in batch {
-                batch_bytes.extend(record_bytes);
-            }
-
-            self.file.write_all(&batch_bytes)?;
-            self.current_offset += batch_bytes.len() as u64;
-
-            self.file.sync_all()?;
-        }
-
-        self.is_syncing = false;
-        Ok(offset)
+        reply_rx.recv().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Flusher dropped reply")
+        })?
     }
 
 
-    pub fn read_all(&mut self) -> std::io::Result<Vec<Record>> {
+    pub fn read_all(&self) -> std::io::Result<Vec<Record>> {
+        let mut file = File::open(&self.path)?;
         let mut records = Vec::new();
-
-        self.file.seek(SeekFrom::Start(0))?;
 
         loop {
             let mut header_buf = [0u8; 8];
-
-            match self.file.read_exact(&mut header_buf) {
+            match file.read_exact(&mut header_buf) {
                 Ok(()) => {
                     let checksum = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
                     let length = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
 
                     let mut payload_buf = vec![0u8; length as usize];
-                    self.file.read_exact(&mut payload_buf)?;
+                    file.read_exact(&mut payload_buf)?;
 
                     records.push(Record {
                         checksum,
@@ -150,28 +174,30 @@ impl LogStore {
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     break Ok(records);
                 }
-                Err(e) => {
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
     }
 
-    pub fn read_at(&mut self, record_index: usize) -> std::io::Result<Record> {
-        let offset = self.index.get(record_index).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "Record not found")
-        })?;
+    pub fn read_at(&self, record_index: usize) -> std::io::Result<Record> {
+        let offset = {
+            let idx_guard = self.index.read().unwrap();
+            *idx_guard.get(record_index).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "Record not found")
+            })?
+        };
 
-        self.file.seek(SeekFrom::Start(*offset))?;
-            
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(offset))?;
+
         let mut header_buf = [0u8; 8];
-        self.file.read_exact(&mut header_buf)?;
+        file.read_exact(&mut header_buf)?;
 
         let checksum = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
         let length = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
 
         let mut payload_buf = vec![0u8; length as usize];
-        self.file.read_exact(&mut payload_buf)?;
+        file.read_exact(&mut payload_buf)?;
 
         Ok(Record {
             checksum,

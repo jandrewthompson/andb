@@ -14,7 +14,7 @@ fn bench_current_appends() {
     }
 
     let store = LogStore::open(log_path).unwrap();
-    let shared_store = Arc::new(Mutex::new(store));
+    let shared_store = Arc::new(store);
 
 
     let num_threads = 16;
@@ -32,8 +32,7 @@ fn bench_current_appends() {
         let handle = thread::spawn(move || {
             for i in 0..appends_per_thread {
                 let payload = format!("thread {} record {}", t, i);
-                let mut store = store_clone.lock().unwrap();
-                store.append(payload.as_bytes()).unwrap();
+                store_clone.append(payload.as_bytes()).unwrap();
             }
         });
 
