@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}, {}", r.checksum, r.length, );
 
 
-    let mut log = LogStore::open("test.log")?;
+    let log = LogStore::open("test.log")?;
 
     let offset1 = log.append(b"Hello, Rust Log!")?;
     println!("Wrote record 1 at offset: {}", offset1);

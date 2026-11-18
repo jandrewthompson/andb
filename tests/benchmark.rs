@@ -1,5 +1,5 @@
 use andb::LogStore;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use std::path::Path;

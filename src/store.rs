@@ -220,7 +220,7 @@ mod tests {
             let _ = std::fs::remove_file(log_path);
         }
 
-        let mut store = LogStore::open(log_path).unwrap();
+        let store = LogStore::open(log_path).unwrap();
         let payload = b"Unit test payload";
 
         let offset = store.append(payload).unwrap();
@@ -242,7 +242,7 @@ mod tests {
             let _ = std::fs::remove_file(log_path);
         }
 
-        let mut store = LogStore::open(log_path).unwrap();
+        let store = LogStore::open(log_path).unwrap();
         store.append(b"Zero").unwrap();
         store.append(b"One").unwrap();
         store.append(b"Two").unwrap();
@@ -252,7 +252,7 @@ mod tests {
 
         drop(store);
 
-        let mut store_reopened = LogStore::open(log_path).unwrap();
+        let store_reopened = LogStore::open(log_path).unwrap();
         let rec_zero = store_reopened.read_at(0).unwrap();
         assert_eq!(rec_zero.payload, b"Zero");
 
